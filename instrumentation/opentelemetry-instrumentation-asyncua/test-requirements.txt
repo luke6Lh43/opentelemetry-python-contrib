@@ -1,0 +1,5 @@
+asyncua >= 1.0.0
+pytest
+pytest-asyncio
+opentelemetry-api
+opentelemetry-sdk
