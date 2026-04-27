@@ -39,8 +39,8 @@ Run instrumented code:
 
 Only client-initiated operations are traced. The instrumentor installs
 wrappers on the shared ``Node`` class (which is also used by asyncua's
-server internals); server-side bookkeeping operations are filtered out by
-inspecting the node's session type.
+server internals); server-side bookkeeping operations are filtered out
+by inspecting the node's session type.
 
 API
 ---
@@ -50,6 +50,9 @@ from __future__ import annotations
 
 from typing import Any, Collection
 
+from asyncua.client.client import Client
+from asyncua.client.ua_client import UaClient
+from asyncua.common.node import Node
 from wrapt import wrap_function_wrapper
 
 from opentelemetry import trace
@@ -128,10 +131,6 @@ class AsyncuaInstrumentor(BaseInstrumentor):
         )
 
     def _uninstrument(self, **kwargs: Any) -> None:
-        # Local imports so uninstrument does not fail if asyncua is absent.
-        from asyncua.client.client import Client
-        from asyncua.common.node import Node
-
         unwrap(Client, "connect")
         unwrap(Client, "disconnect")
         unwrap(Node, "read_value")
@@ -151,8 +150,6 @@ def _is_client_node(node: Any) -> bool:
     without generating spans.
     """
     try:
-        # Import here to avoid import cost when instrumentation is disabled.
-        from asyncua.client.ua_client import UaClient
         return isinstance(node.session, UaClient)
     except Exception:  # pylint: disable=broad-except
         return False
@@ -193,14 +190,6 @@ def _safe_port(client: Any) -> int | None:
     except Exception:  # pylint: disable=broad-except
         return None
 
-
-def _record_exception(span, exc: BaseException) -> None:
-    """Attach exception info to a span per OTel conventions."""
-    if not span.is_recording():
-        return
-    span.set_status(Status(StatusCode.ERROR, str(exc)))
-    span.record_exception(exc)
-    span.set_attribute(_ERROR_TYPE, type(exc).__qualname__)
 
 def _safe_security_policy(client: Any) -> str | None:
     """Return the security policy short name (e.g. 'None', 'Basic256Sha256').
@@ -243,6 +232,16 @@ def _safe_security_mode(client: Any) -> str | None:
     except Exception:  # pylint: disable=broad-except
         return None
 
+
+def _record_exception(span, exc: BaseException) -> None:
+    """Attach exception info to a span per OTel conventions."""
+    if not span.is_recording():
+        return
+    span.set_status(Status(StatusCode.ERROR, str(exc)))
+    span.record_exception(exc)
+    span.set_attribute(_ERROR_TYPE, type(exc).__qualname__)
+
+
 # ----- Wrapper factories -----
 
 
@@ -265,14 +264,10 @@ def _wrap_connect(tracer: Tracer):
                     span.set_attribute(_SERVER_PORT, port)
                 security_policy = _safe_security_policy(instance)
                 if security_policy:
-                    span.set_attribute(
-                        _OPCUA_SECURITY_POLICY, security_policy
-                    )
+                    span.set_attribute(_OPCUA_SECURITY_POLICY, security_policy)
                 security_mode = _safe_security_mode(instance)
                 if security_mode:
-                    span.set_attribute(
-                        _OPCUA_SECURITY_MODE, security_mode
-                    )
+                    span.set_attribute(_OPCUA_SECURITY_MODE, security_mode)
             try:
                 return await wrapped(*args, **kwargs)
             except Exception as exc:
@@ -347,9 +342,7 @@ def _wrap_write_value(tracer: Tracer):
                 if variant_type is None and len(args) >= 2:
                     variant_type = args[1]
                 if variant_type is not None:
-                    span.set_attribute(
-                        _OPCUA_VARIANT_TYPE, str(variant_type)
-                    )
+                    span.set_attribute(_OPCUA_VARIANT_TYPE, str(variant_type))
             try:
                 return await wrapped(*args, **kwargs)
             except Exception as exc:
