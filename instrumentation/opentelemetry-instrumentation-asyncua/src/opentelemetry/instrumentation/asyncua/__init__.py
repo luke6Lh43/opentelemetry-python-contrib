@@ -42,6 +42,20 @@ wrappers on the shared ``Node`` class (which is also used by asyncua's
 server internals); server-side bookkeeping operations are filtered out
 by inspecting the node's session type.
 
+Session-level grouping
+----------------------
+
+For each connected ``Client``, the instrumentor opens a long-lived
+``opcua.session`` span on ``Client.connect()`` and closes it on
+``Client.disconnect()``. All intermediate read / write / call_method
+spans become children of this session span, so a full client session
+appears as a single trace with a coherent parent-child structure.
+
+If an enclosing span is already active when ``connect()`` runs (for
+example, an HTTP request span from an outer framework), the
+``opcua.session`` span will naturally parent to it, preserving the
+full distributed trace across process boundaries.
+
 API
 ---
 """
@@ -55,6 +69,7 @@ from asyncua.client.ua_client import UaClient
 from asyncua.common.node import Node
 from wrapt import wrap_function_wrapper
 
+from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.instrumentation.asyncua.package import _instruments
 from opentelemetry.instrumentation.asyncua.version import __version__
@@ -80,6 +95,12 @@ _OPCUA_SECURITY_MODE = "opcua.security_mode"
 _SERVER_ADDRESS = "server.address"
 _SERVER_PORT = "server.port"
 _ERROR_TYPE = "error.type"
+
+# Per-Client state stashed by _wrap_connect and consumed by _wrap_disconnect.
+# Stored as an attribute on the Client instance (value: tuple[Span, Token]).
+# A dunder-like private name avoids collision with asyncua's own fields and
+# any user subclassing.
+_SESSION_STATE_ATTR = "_otel_asyncua_session_state"
 
 
 class AsyncuaInstrumentor(BaseInstrumentor):
@@ -233,8 +254,50 @@ def _safe_security_mode(client: Any) -> str | None:
         return None
 
 
+def _set_connection_attributes(span, client: Any) -> None:
+    """Attach endpoint / host / port attributes to a span.
+
+    Used by both the session span and the connect span so connection
+    context is visible regardless of which span a viewer focuses on.
+    """
+    if not span.is_recording():
+        return
+    endpoint = _safe_endpoint(client)
+    host = _safe_host(client)
+    port = _safe_port(client)
+    if endpoint:
+        span.set_attribute(_OPCUA_ENDPOINT, endpoint)
+    if host:
+        span.set_attribute(_SERVER_ADDRESS, host)
+    if port is not None:
+        span.set_attribute(_SERVER_PORT, port)
+
+
+def _set_security_attributes(span, client: Any) -> None:
+    """Attach security policy / mode attributes to a span.
+
+    These are only reliably populated after a successful connect; calling
+    this helper before ``connect()`` returns is safe (missing values are
+    simply skipped).
+    """
+    if not span.is_recording():
+        return
+    security_policy = _safe_security_policy(client)
+    if security_policy:
+        span.set_attribute(_OPCUA_SECURITY_POLICY, security_policy)
+    security_mode = _safe_security_mode(client)
+    if security_mode:
+        span.set_attribute(_OPCUA_SECURITY_MODE, security_mode)
+
+
 def _record_exception(span, exc: BaseException) -> None:
-    """Attach exception info to a span per OTel conventions."""
+    """Attach exception info to a span per OTel conventions.
+
+    Wrappers pair this with ``record_exception=False`` on
+    ``start_as_current_span`` so the context manager doesn't also
+    auto-record the same exception (which would produce duplicate
+    exception events on the span).
+    """
     if not span.is_recording():
         return
     span.set_status(Status(StatusCode.ERROR, str(exc)))
@@ -242,46 +305,110 @@ def _record_exception(span, exc: BaseException) -> None:
     span.set_attribute(_ERROR_TYPE, type(exc).__qualname__)
 
 
+def _end_session(instance: Any, exc: BaseException | None = None) -> None:
+    """Close out a session span previously attached to ``instance``.
+
+    Safe to call multiple times; a no-op if no session is currently
+    attached to the Client. If an exception is supplied, it is recorded
+    on the session span before it is closed.
+    """
+    state = getattr(instance, _SESSION_STATE_ATTR, None)
+    if state is None:
+        return
+    session_span, token = state
+    try:
+        if exc is not None:
+            _record_exception(session_span, exc)
+        session_span.end()
+    finally:
+        otel_context.detach(token)
+        try:
+            delattr(instance, _SESSION_STATE_ATTR)
+        except AttributeError:
+            pass
+
+
 # ----- Wrapper factories -----
 
 
 def _wrap_connect(tracer: Tracer):
+    """Wrap Client.connect() to open a session-level span.
+
+    The session span lives from ``connect()`` until the matching
+    ``disconnect()`` (or until connect itself fails). Because it spans
+    multiple awaits, it is started as a *detached* span and attached to
+    the current context manually — not via a ``with`` block.
+
+    Inside connect(), a short-lived ``opcua.connect`` child span is
+    opened so the connect phase remains visible as its own operation.
+    """
     async def wrapper(wrapped, instance, args, kwargs):
+        # If a previous session wasn't cleaned up (e.g. connect() called
+        # twice without disconnect()), close it first to avoid leaking
+        # spans or stacking contexts.
+        if getattr(instance, _SESSION_STATE_ATTR, None) is not None:
+            _end_session(instance)
+
+        # 1. Open the session span and attach it to the current context
+        #    so that every child span emitted before disconnect() parents
+        #    to it and shares its trace_id.
+        session_span = tracer.start_span(
+            "opcua.session",
+            kind=SpanKind.CLIENT,
+        )
+        if session_span.is_recording():
+            session_span.set_attribute(_OPCUA_OPERATION, "session")
+            _set_connection_attributes(session_span, instance)
+
+        ctx = trace.set_span_in_context(session_span)
+        token = otel_context.attach(ctx)
+        setattr(instance, _SESSION_STATE_ATTR, (session_span, token))
+
+        # 2. Inside the session, record connect() itself as a child span.
         with tracer.start_as_current_span(
             "opcua.connect",
             kind=SpanKind.CLIENT,
+            record_exception=False,
         ) as span:
             if span.is_recording():
                 span.set_attribute(_OPCUA_OPERATION, "connect")
-                endpoint = _safe_endpoint(instance)
-                host = _safe_host(instance)
-                port = _safe_port(instance)
-                if endpoint:
-                    span.set_attribute(_OPCUA_ENDPOINT, endpoint)
-                if host:
-                    span.set_attribute(_SERVER_ADDRESS, host)
-                if port is not None:
-                    span.set_attribute(_SERVER_PORT, port)
-                security_policy = _safe_security_policy(instance)
-                if security_policy:
-                    span.set_attribute(_OPCUA_SECURITY_POLICY, security_policy)
-                security_mode = _safe_security_mode(instance)
-                if security_mode:
-                    span.set_attribute(_OPCUA_SECURITY_MODE, security_mode)
+                _set_connection_attributes(span, instance)
+                # Security details are typically not meaningful until
+                # after the secure channel opens, but we try opportunistically.
+                _set_security_attributes(span, instance)
             try:
-                return await wrapped(*args, **kwargs)
+                result = await wrapped(*args, **kwargs)
             except Exception as exc:
                 _record_exception(span, exc)
+                # The session never fully opened — close it now so we
+                # don't leak a long-lived span on a failed connect.
+                _end_session(instance, exc)
                 raise
+
+            # Post-connect: security attributes are now reliable. Copy
+            # them onto the session span so the full-session view carries
+            # the negotiated policy/mode even if the connect span is
+            # collapsed in the UI.
+            _set_security_attributes(span, instance)
+            state = getattr(instance, _SESSION_STATE_ATTR, None)
+            if state is not None:
+                _set_security_attributes(state[0], instance)
+            return result
 
     return wrapper
 
 
 def _wrap_disconnect(tracer: Tracer):
+    """Wrap Client.disconnect() to close out the session span.
+
+    The ``opcua.disconnect`` span itself is a child of the session span,
+    giving a clean bookend to the trace.
+    """
     async def wrapper(wrapped, instance, args, kwargs):
         with tracer.start_as_current_span(
             "opcua.disconnect",
             kind=SpanKind.CLIENT,
+            record_exception=False,
         ) as span:
             if span.is_recording():
                 span.set_attribute(_OPCUA_OPERATION, "disconnect")
@@ -289,10 +416,16 @@ def _wrap_disconnect(tracer: Tracer):
                 if endpoint:
                     span.set_attribute(_OPCUA_ENDPOINT, endpoint)
             try:
-                return await wrapped(*args, **kwargs)
+                result = await wrapped(*args, **kwargs)
             except Exception as exc:
                 _record_exception(span, exc)
+                # Still end the session — disconnect failing doesn't
+                # justify leaking the session span forever.
+                _end_session(instance, exc)
                 raise
+
+            _end_session(instance)
+            return result
 
     return wrapper
 
@@ -306,6 +439,7 @@ def _wrap_read_value(tracer: Tracer):
         with tracer.start_as_current_span(
             "opcua.read",
             kind=SpanKind.CLIENT,
+            record_exception=False,
         ) as span:
             if span.is_recording():
                 span.set_attribute(_OPCUA_OPERATION, "read")
@@ -329,6 +463,7 @@ def _wrap_write_value(tracer: Tracer):
         with tracer.start_as_current_span(
             "opcua.write",
             kind=SpanKind.CLIENT,
+            record_exception=False,
         ) as span:
             if span.is_recording():
                 span.set_attribute(_OPCUA_OPERATION, "write")
@@ -360,6 +495,7 @@ def _wrap_call_method(tracer: Tracer):
         with tracer.start_as_current_span(
             "opcua.call_method",
             kind=SpanKind.CLIENT,
+            record_exception=False,
         ) as span:
             if span.is_recording():
                 span.set_attribute(_OPCUA_OPERATION, "call_method")
