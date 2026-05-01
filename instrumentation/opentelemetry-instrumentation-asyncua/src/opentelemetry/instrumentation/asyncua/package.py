@@ -13,4 +13,4 @@
 # limitations under the License.
 
 
-_instruments = ("asyncua >= 1.0.0",)
+_instruments = ("asyncua >= 1.0.0, < 2.0.0",)
