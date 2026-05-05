@@ -38,6 +38,7 @@ dependencies = [
     "opentelemetry-instrumentation-asyncclick==0.63b0.dev",
     "opentelemetry-instrumentation-asyncio==0.63b0.dev",
     "opentelemetry-instrumentation-asyncpg==0.63b0.dev",
+    "opentelemetry-instrumentation-asyncua==0.63b0.dev",
     "opentelemetry-instrumentation-aws-lambda==0.63b0.dev",
     "opentelemetry-instrumentation-boto3sqs==0.63b0.dev",
     "opentelemetry-instrumentation-botocore==0.63b0.dev",

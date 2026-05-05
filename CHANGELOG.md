@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- `opentelemetry-instrumentation-asyncua` Initial release with instrumentation
+  for `Node.read_value` operations in the `asyncua` OPC UA client library.
+  ([#XXXX](https://github.com/open-telemetry/opentelemetry-python-contrib/pull/XXXX))
+
 ### Added
 
 - Bump `pylint` to `4.0.5`
